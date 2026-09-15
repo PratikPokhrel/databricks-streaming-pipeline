@@ -23,8 +23,9 @@ from pyspark.sql.types import (
     StructType, StructField, StringType, IntegerType, LongType, DoubleType,
 )
 
-KAFKA_BOOTSTRAP_SERVERS = spark.conf.get("kafka_bootstrap_servers", "7.tcp.ngrok.io:24168")
-TOPIC_PREFIX = spark.conf.get("kafka_topic_prefix", "neon.public")
+# Use DLT pipeline configuration (Serverless-compatible)
+KAFKA_BOOTSTRAP_SERVERS = dlt.conf.get("kafka_bootstrap_servers", "7.tcp.ngrok.io:24168")
+TOPIC_PREFIX = dlt.conf.get("kafka_topic_prefix", "neon.public")
 
 # COMMAND ----------
 
@@ -76,12 +77,14 @@ def parse_debezium_topic(raw_kafka_df, row_schema, date_fields=None):
         .select("envelope.after.*", F.col("envelope.op").alias("__op"))
     )
 
-    for field_name in date_fields:
-        parsed = parsed.withColumn(
-            field_name, F.expr(f"date_add(to_date('1970-01-01'), {field_name})")
-        )
-
-    return parsed.withColumn("_bronze_loaded_at", F.current_timestamp())
+    # Apply all date conversions at once to avoid nested execution plan
+    date_conversions = {
+        field_name: F.expr(f"date_add(to_date('1970-01-01'), {field_name})")
+        for field_name in date_fields
+    }
+    date_conversions["_bronze_loaded_at"] = F.current_timestamp()
+    
+    return parsed.withColumns(date_conversions)
 
 
 def read_debezium_topic(table_name):
