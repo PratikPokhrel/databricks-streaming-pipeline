@@ -35,18 +35,31 @@ Sync transactional data from a Postgres database (customers, orders, products, e
 ## 🏗️ Architecture
 
 ```
-┌─────────────────┐
-│  Postgres DB    │
-│  (Operational)  │
-└────────┬────────┘
-         │ CDC
+┌─────────────────────────────────────────────────────────────┐
+│                     NEON POSTGRES (Cloud)                   │
+│                    Operational Database                     │
+│  • customers, orders, products, order_items, etc.           │
+└────────┬────────────────────────────────────────────────────┘
+         │ CDC Stream
          ▼
-┌─────────────────┐
-│    Debezium     │
-│  (CDC Capture)  │
-└────────┬────────┘
-         │ Kafka Topics
-         ▼
+┌─────────────────────────────────────────────────────────────┐
+│                    DOCKER ENVIRONMENT                        │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│  ┌──────────────────┐         ┌─────────────────────────┐  │
+│  │   Debezium       │         │   Apache Kafka          │  │
+│  │   Connector      │────────▶│   (Confluent/Local)     │  │
+│  │   (Postgres CDC) │         │   • Topics: neon.public │  │
+│  └──────────────────┘         └──────────┬──────────────┘  │
+│                                          │                  │
+│                                          ▼                  │
+│                               ┌─────────────────────────┐  │
+│                               │   nginx (Reverse Proxy) │  │
+│                               │   TCP Tunneling         │  │
+│                               └──────────┬──────────────┘  │
+└───────────────────────────────────────────┼──────────────────┘
+                                            │ Public Endpoint
+                                            ▼
 ┌─────────────────────────────────────────────────────────────┐
 │                    DATABRICKS LAKEHOUSE                     │
 ├─────────────────────────────────────────────────────────────┤
@@ -154,8 +167,11 @@ databricks-streaming-pipeline/
 
 ### Infrastructure
 - **Databricks Workspace** (DBR 18.1+)
-- **Kafka Cluster** (Confluent, MSK, self-hosted)
-- **Debezium Connector** for your source database
+- **Neon Postgres** - Cloud-hosted operational database
+- **Docker Environment** with:
+  - **Kafka** (Confluent Platform or Apache Kafka)
+  - **Debezium Connector** for Postgres CDC
+  - **nginx** for TCP tunneling/reverse proxy
 - **Unity Catalog** enabled (recommended)
 
 ### Access & Permissions
@@ -164,8 +180,171 @@ databricks-streaming-pipeline/
 - **Cluster or Serverless compute** with network access to Kafka
 
 ### Source Data
-- Postgres database with tables: `customers`, `orders`, `products`, `order_items`, `addresses`, etc.
+- Neon Postgres database with tables: `customers`, `orders`, `products`, `order_items`, `addresses`, etc.
 - Debezium CDC configured with topic prefix `neon.public`
+
+### Network Setup
+- **nginx** exposes Kafka externally via TCP tunneling (e.g., ngrok, custom reverse proxy)
+- Databricks can reach Kafka through the public nginx endpoint
+- CDC events flow: Neon Postgres → Debezium → Kafka → nginx → Databricks
+
+---
+
+## 🐳 Docker Infrastructure Setup
+
+### Components Running in Docker
+
+#### 1. Apache Kafka
+```yaml
+# Kafka broker for event streaming
+services:
+  kafka:
+    image: confluentinc/cp-kafka:latest
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+```
+
+#### 2. Debezium Connector
+```yaml
+# Debezium for Postgres CDC
+services:
+  debezium:
+    image: debezium/connect:latest
+    ports:
+      - "8083:8083"
+    environment:
+      BOOTSTRAP_SERVERS: kafka:9092
+      CONFIG_STORAGE_TOPIC: debezium_configs
+      OFFSET_STORAGE_TOPIC: debezium_offsets
+```
+
+**Debezium Connector Configuration:**
+```json
+{
+  "name": "neon-postgres-connector",
+  "config": {
+    "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
+    "database.hostname": "<neon-host>.neon.tech",
+    "database.port": "5432",
+    "database.user": "<username>",
+    "database.password": "<password>",
+    "database.dbname": "<database>",
+    "database.server.name": "neon",
+    "table.include.list": "public.customers,public.orders,public.products,...",
+    "plugin.name": "pgoutput",
+    "topic.prefix": "neon"
+  }
+}
+```
+
+#### 3. nginx (TCP Tunneling)
+```yaml
+# nginx for exposing Kafka to external networks
+services:
+  nginx:
+    image: nginx:latest
+    ports:
+      - "24168:9092"  # External:Internal
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf
+```
+
+**nginx Configuration (`nginx.conf`):**
+```nginx
+stream {
+    upstream kafka {
+        server kafka:9092;
+    }
+    
+    server {
+        listen 9092;
+        proxy_pass kafka;
+        proxy_connect_timeout 5s;
+    }
+}
+```
+
+### Docker Compose Example
+
+```yaml
+version: '3.8'
+
+services:
+  zookeeper:
+    image: confluentinc/cp-zookeeper:latest
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+    
+  kafka:
+    image: confluentinc/cp-kafka:latest
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      
+  debezium:
+    image: debezium/connect:latest
+    depends_on:
+      - kafka
+    ports:
+      - "8083:8083"
+    environment:
+      BOOTSTRAP_SERVERS: kafka:9092
+      GROUP_ID: 1
+      CONFIG_STORAGE_TOPIC: debezium_configs
+      OFFSET_STORAGE_TOPIC: debezium_offsets
+      STATUS_STORAGE_TOPIC: debezium_statuses
+      
+  nginx:
+    image: nginx:latest
+    depends_on:
+      - kafka
+    ports:
+      - "24168:9092"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf
+```
+
+### Starting the Stack
+
+```bash
+# Start all services
+docker-compose up -d
+
+# Check service health
+docker-compose ps
+
+# View logs
+docker-compose logs -f debezium
+
+# Register Debezium connector
+curl -X POST http://localhost:8083/connectors \
+  -H "Content-Type: application/json" \
+  -d @neon-postgres-connector.json
+
+# Verify connector status
+curl http://localhost:8083/connectors/neon-postgres-connector/status
+```
+
+### Network Flow
+
+```
+Neon Postgres (Cloud)
+    ↓ (CDC via logical replication)
+Debezium Connector (Docker)
+    ↓ (Produce events)
+Kafka (Docker)
+    ↓ (TCP stream)
+nginx (Docker - Port 24168)
+    ↓ (Public endpoint)
+Databricks (readStream.format("kafka"))
+```
 
 ---
 
@@ -184,9 +363,12 @@ Update the pipeline parameters with your Kafka details:
 
 ```python
 # In pipeline settings
-kafka_bootstrap_servers = "your-kafka-server:9092"
-kafka_topic_prefix = "neon.public"  # Or your Debezium topic prefix
+# Use your nginx public endpoint (from ngrok, EC2, or your reverse proxy)
+kafka_bootstrap_servers = "7.tcp.ngrok.io:24168"  # Or your nginx public endpoint
+kafka_topic_prefix = "neon.public"  # Debezium topic prefix
 ```
+
+**Note:** The `kafka_bootstrap_servers` should point to your nginx reverse proxy endpoint that tunnels to the Kafka broker running in Docker.
 
 ### 3️⃣ Create the Bronze Pipeline
 
@@ -459,6 +641,10 @@ This project is open source and available under the MIT License.
 - **Databricks** for Lakeflow Spark Declarative Pipelines
 - **Debezium** for CDC capture
 - **Delta Lake** for reliable lakehouse storage
+- **Neon** for cloud Postgres database
+- **Apache Kafka** for event streaming
+- **nginx** for TCP tunneling and reverse proxy
+- **Docker** for containerized infrastructure
 
 ---
 
