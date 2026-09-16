@@ -24,8 +24,8 @@ from pyspark.sql.types import (
 )
 
 # Use DLT pipeline configuration (Serverless-compatible)
-KAFKA_BOOTSTRAP_SERVERS = dlt.conf.get("kafka_bootstrap_servers", "7.tcp.ngrok.io:24168")
-TOPIC_PREFIX = dlt.conf.get("kafka_topic_prefix", "neon.public")
+KAFKA_BOOTSTRAP_SERVERS = spark.conf.get("kafka_bootstrap_servers", "7.tcp.ngrok.io:24168")
+TOPIC_PREFIX = spark.conf.get("kafka_topic_prefix", "neon.public")
 
 # COMMAND ----------
 

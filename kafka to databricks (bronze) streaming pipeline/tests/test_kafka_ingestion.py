@@ -18,10 +18,6 @@ from pyspark.sql.types import (
 )
 from pyspark.pipelines.testing import test_spark
 
-# Import the transformation functions from the pipeline
-import sys
-sys.path.append("/Workspace/Users/pratikpokhrel51@gmail.com/New Pipeline 2026-09-15 12:13/transformations")
-
 # COMMAND ----------
 
 # MAGIC %md

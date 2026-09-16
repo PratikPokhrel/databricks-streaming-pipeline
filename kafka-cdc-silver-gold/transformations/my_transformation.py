@@ -30,7 +30,7 @@ BRONZE_SCHEMA = spark.conf.get("bronze_schema", "silver")
 
 
 def _bronze_table(name):
-    return f"{BRONZE_CATALOG}.{BRONZE_SCHEMA}.{name}"
+    return f"{BRONZE_CATALOG}.{BRONZE_SCHEMA}.bronze_{name}"
 
 # COMMAND ----------
 
@@ -42,7 +42,7 @@ def _bronze_table(name):
 
 @dlt.view(name="customers_cleaned")
 def customers_cleaned():
-    df = spark.readStream.table(_bronze_table("bronze_customers"))
+    df = spark.readStream.table(_bronze_table("customers"))
     return df.select(
         F.col("customer_id"),
         F.trim(F.col("name")).alias("customer_name"),
@@ -98,7 +98,7 @@ def dim_customers():
 
 @dlt.view(name="products_cleaned")
 def products_cleaned():
-    df = spark.readStream.table(_bronze_table("bronze_products"))
+    df = spark.readStream.table(_bronze_table("products"))
     return df.select(
         F.col("product_id"),
         F.col("sku"),
@@ -153,7 +153,7 @@ def dim_products():
 
 @dlt.view(name="orders_cleaned")
 def orders_cleaned():
-    df = spark.readStream.table(_bronze_table("bronze_orders"))
+    df = spark.readStream.table(_bronze_table("orders"))
     return df.select(
         F.col("order_id"),
         F.col("customer_id"),
@@ -198,7 +198,7 @@ dlt.apply_changes(
 @dlt.expect("valid_quantity", "quantity > 0")
 @dlt.expect("valid_unit_price", "unit_price > 0")
 def silver_order_items():
-    df = spark.readStream.table(_bronze_table("bronze_order_items"))
+    df = spark.readStream.table(_bronze_table("order_items"))
     return df.select(
         F.col("order_item_id"),
         F.col("order_id"),
@@ -215,7 +215,7 @@ def silver_order_items():
 )
 @dlt.expect_or_drop("has_customer", "customer_id IS NOT NULL")
 def silver_addresses():
-    df = spark.readStream.table(_bronze_table("bronze_addresses"))
+    df = spark.readStream.table(_bronze_table("addresses"))
     return df.select(
         F.col("address_id"),
         F.col("customer_id"),
@@ -235,7 +235,7 @@ def silver_addresses():
 )
 @dlt.expect_or_drop("has_order_id", "order_id IS NOT NULL")
 def silver_order_status_history():
-    df = spark.readStream.table(_bronze_table("bronze_order_status_history"))
+    df = spark.readStream.table(_bronze_table("order_status_history"))
     return df.select(
         F.col("history_id"),
         F.col("order_id"),
@@ -251,7 +251,7 @@ def silver_order_status_history():
 )
 @dlt.expect("valid_rating", "rating BETWEEN 1 AND 5")
 def silver_reviews():
-    df = spark.readStream.table(_bronze_table("bronze_reviews"))
+    df = spark.readStream.table(_bronze_table("reviews"))
     return df.select(
         F.col("review_id"),
         F.col("customer_id"),
@@ -277,7 +277,7 @@ def silver_reviews():
 @dlt.expect_or_drop("has_order_id", "order_id IS NOT NULL")
 @dlt.expect("valid_amount", "amount > 0")
 def silver_payments():
-    df = spark.readStream.table(_bronze_table("bronze_payments"))
+    df = spark.readStream.table(_bronze_table("payments"))
     return df.select(
         F.col("payment_id"),
         F.col("order_id"),
@@ -294,7 +294,7 @@ def silver_payments():
 )
 @dlt.expect_or_drop("has_order_id", "order_id IS NOT NULL")
 def silver_shipments():
-    df = spark.readStream.table(_bronze_table("bronze_shipments"))
+    df = spark.readStream.table(_bronze_table("shipments"))
     return df.select(
         F.col("shipment_id"),
         F.col("order_id"),
@@ -308,7 +308,7 @@ def silver_shipments():
 
 @dlt.table(name="silver_categories", comment="Standardized categories - typed.")
 def silver_categories():
-    df = spark.readStream.table(_bronze_table("bronze_categories"))
+    df = spark.readStream.table(_bronze_table("categories"))
     return df.select(
         F.col("category_id"),
         F.col("category_name"),
@@ -318,7 +318,7 @@ def silver_categories():
 
 @dlt.table(name="silver_channels", comment="Standardized channels - typed.")
 def silver_channels():
-    df = spark.readStream.table(_bronze_table("bronze_channels"))
+    df = spark.readStream.table(_bronze_table("channels"))
     return df.select(
         F.col("channel_id"),
         F.col("channel_name"),
@@ -364,14 +364,16 @@ def dim_date():
 
 
 @dlt.table(
-    name="gold_orders_enriched",
-    comment="Orders enriched with the customer profile ACTIVE AT THE TIME the "
-            "order was placed - point-in-time join, not current tier.",
+    name="fact_orders",
+    comment="Canonical order fact - degenerate dimension (order_id), foreign "
+            "keys to dimensions (point-in-time correct), and measures ONLY. "
+            "No customer_name/loyalty_tier/channel_name here - those live in "
+            "the dimensions and are reached via customer_sk/channel_id. This "
+            "is the table Power BI relationships should be built against.",
 )
-def gold_orders_enriched():
+def fact_orders():
     orders = dlt.read("silver_orders")
     customers = dlt.read("dim_customers")
-    channels = dlt.read("dim_channels")
 
     return (
         orders.alias("o")
@@ -382,29 +384,26 @@ def gold_orders_enriched():
             & (F.col("c.valid_to").isNull() | (F.col("o.created_at") < F.col("c.valid_to"))),
             "left",
         )
-        .join(channels.alias("ch"), F.col("o.channel_id") == F.col("ch.channel_id"), "left")
         .select(
-            F.col("o.order_id"),
-            F.col("o.customer_id"),
-            F.col("c.customer_sk"),
-            F.col("c.customer_name"),
-            F.col("c.loyalty_tier"),
-            F.col("o.product"),
-            F.col("o.amount"),
-            F.col("o.order_status"),
-            F.col("ch.channel_name"),
+            F.col("o.order_id"),              # degenerate dimension
+            F.col("o.customer_id"),            # natural key, kept for traceability/aggregation
+            F.col("c.customer_sk"),             # FK -> dim_customers (point-in-time correct)
+            F.col("o.channel_id"),             # FK -> dim_channels
+            F.to_date("o.created_at").alias("order_date"),  # FK -> dim_date
+            F.col("o.amount"),                 # measure
+            F.col("o.order_status"),           # degenerate attribute of the order itself
             F.col("o.created_at").alias("order_created_at"),
-            F.to_date("o.created_at").alias("order_date"),
         )
     )
 
 
 @dlt.table(
-    name="gold_order_items_enriched",
-    comment="Order line items enriched with the product price and customer "
-            "ACTIVE AT THE TIME of the order - point-in-time joins.",
+    name="fact_order_items",
+    comment="Canonical order line-item fact - degenerate dimensions "
+            "(order_item_id, order_id), foreign keys, and measures ONLY. "
+            "Same rule as fact_orders: no product_name/customer_name inlined.",
 )
-def gold_order_items_enriched():
+def fact_order_items():
     order_items = dlt.read("silver_order_items")
     orders = dlt.read("silver_orders")
     products = dlt.read("dim_products")
@@ -428,20 +427,20 @@ def gold_order_items_enriched():
             "left",
         )
         .select(
-            F.col("oi.order_item_id"),
-            F.col("oi.order_id"),
-            F.col("oi.product_id"),
-            F.col("p.product_sk"),
-            F.col("o.customer_id"),
-            F.col("c.customer_sk"),
-            F.col("p.price").alias("price_at_time_of_order"),
-            F.col("oi.quantity"),
-            F.col("oi.discount_pct"),
+            F.col("oi.order_item_id"),         # degenerate dimension
+            F.col("oi.order_id"),              # degenerate dimension (links to fact_orders)
+            F.col("oi.product_id"),             # natural key, kept for traceability
+            F.col("p.product_sk"),              # FK -> dim_products
+            F.col("o.customer_id"),             # natural key, kept for traceability
+            F.col("c.customer_sk"),             # FK -> dim_customers
+            F.col("p.price").alias("price_at_time_of_order"),  # measure
+            F.col("oi.quantity"),               # measure
+            F.col("oi.discount_pct"),           # measure
             (
                 F.col("oi.quantity")
                 * F.col("p.price")
                 * (F.lit(1) - F.coalesce(F.col("oi.discount_pct"), F.lit(0)))
-            ).alias("line_total"),
+            ).alias("line_total"),               # measure
         )
     )
 
@@ -454,13 +453,14 @@ def gold_order_items_enriched():
 
 
 @dlt.table(
-    name="gold_customer_order_summary",
+    name="agg_customer_summary",
     comment="Per-customer order totals using the customer's CURRENT profile - "
             "deliberately not point-in-time, since this answers 'who is this "
-            "customer today', not history.",
+            "customer today', not history. This is a MART, built on top of "
+            "fact_orders - not itself a canonical fact.",
 )
-def gold_customer_order_summary():
-    orders = dlt.read("gold_orders_enriched")
+def agg_customer_summary():
+    orders = dlt.read("fact_orders")
     customers_current = dlt.read("dim_customers").filter("is_current = true")
 
     agg = orders.groupBy("customer_id").agg(
@@ -485,13 +485,21 @@ def gold_customer_order_summary():
 
 
 @dlt.table(
-    name="gold_daily_revenue",
-    comment="Daily revenue aggregated by order date and channel.",
+    name="agg_daily_revenue",
+    comment="Daily revenue aggregated by order date and channel - a MART "
+            "built on top of fact_orders, with channel_name joined in for "
+            "readability since this table is meant for direct consumption.",
 )
-def gold_daily_revenue():
-    orders = dlt.read("gold_orders_enriched")
-    return orders.groupBy("order_date", "channel_name").agg(
-        F.count("order_id").alias("num_orders"),
-        F.sum("amount").alias("total_revenue"),
-        F.avg("amount").alias("avg_order_value"),
+def agg_daily_revenue():
+    orders = dlt.read("fact_orders")
+    channels = dlt.read("dim_channels")
+    return (
+        orders.alias("o")
+        .join(channels.alias("ch"), F.col("o.channel_id") == F.col("ch.channel_id"), "left")
+        .groupBy("order_date", "ch.channel_name")
+        .agg(
+            F.count("order_id").alias("num_orders"),
+            F.sum("amount").alias("total_revenue"),
+            F.avg("amount").alias("avg_order_value"),
+        )
     )
